@@ -6,11 +6,14 @@ from janus.models import MultiModalityCausalLM, VLChatProcessor
 from PIL import Image
 import numpy as np
 import io
-
+from typing import List
+import json
 app = FastAPI()
 
 # Load model and processor
 model_path = "deepseek-ai/Janus-1.3B"
+# model_path = "deepseek-ai/Janus-Pro-7B"
+
 config = AutoConfig.from_pretrained(model_path)
 language_config = config.language_config
 language_config._attn_implementation = 'eager'
@@ -25,7 +28,10 @@ cuda_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 @torch.inference_mode()
-def multimodal_understanding(image_data, question, seed, top_p, temperature):
+def multimodal_understanding(image_data_list, question, seed, top_p, temperature):
+
+    if not isinstance(image_data_list, list):
+        image_data_list = [image_data_list]
     torch.cuda.empty_cache()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -35,16 +41,18 @@ def multimodal_understanding(image_data, question, seed, top_p, temperature):
         {
             "role": "User",
             "content": f"<image_placeholder>\n{question}",
-            "images": [image_data],
+            "images": image_data_list,
         },
         {"role": "Assistant", "content": ""},
     ]
-
-    pil_images = [Image.open(io.BytesIO(image_data))]
+    pil_images = []
+    for image_data in image_data_list:
+        pil_images.append(Image.open(io.BytesIO(image_data)).convert("RGB"))
+    # breakpoint()
     prepare_inputs = vl_chat_processor(
         conversations=conversation, images=pil_images, force_batchify=True
     ).to(cuda_device, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16)
-    
+
     inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
     outputs = vl_gpt.language_model.generate(
         inputs_embeds=inputs_embeds,
@@ -58,9 +66,10 @@ def multimodal_understanding(image_data, question, seed, top_p, temperature):
         temperature=temperature,
         top_p=top_p,
     )
-    
-    answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
-    return answer
+
+    output_tokens = outputs[0].cpu()
+    answer = tokenizer.decode(output_tokens.tolist(), skip_special_tokens=True)
+    return answer, inputs_embeds, output_tokens
 
 
 @app.post("/understand_image_and_question/")
@@ -72,8 +81,33 @@ async def understand_image_and_question(
     temperature: float = Form(0.1)
 ):
     image_data = await file.read()
-    response = multimodal_understanding(image_data, question, seed, top_p, temperature)
+    response, _, _ = multimodal_understanding(image_data, question, seed, top_p, temperature)
     return JSONResponse({"response": response})
+
+
+@app.post("/understand_images_and_question/")
+async def understand_images_and_question(
+    files:  List[UploadFile] = File(...),
+    question: str = Form(...),
+    seed: int = Form(42),
+    top_p: float = Form(0.95),
+    temperature: float = Form(0.1),
+    return_embeddings: bool = Form(False)
+):
+
+    image_data_list = []
+    for file in files:
+        image_data = await file.read()
+        image_data_list.append(image_data)
+    response, inputs_embeds, output_tokens = multimodal_understanding(image_data_list, question, seed, top_p, temperature)
+
+    if return_embeddings:
+        output_tokens_serialized = json.dumps(output_tokens.float().numpy().tolist())
+        inputs_embeds_serialized = json.dumps(inputs_embeds.float().to("cpu").numpy().tolist())
+        return JSONResponse({"response": response, "inputs_embeds": inputs_embeds_serialized, "output_tokens": output_tokens_serialized})
+    else:
+        return JSONResponse({"response": response})
+
 
 
 def generate(input_ids,
@@ -109,7 +143,7 @@ def generate(input_ids,
         img_embeds = vl_gpt.prepare_gen_img_embeds(next_token)
         inputs_embeds = img_embeds.unsqueeze(dim=1)
     patches = vl_gpt.gen_vision_model.decode_code(
-        generated_tokens.to(dtype=torch.int), 
+        generated_tokens.to(dtype=torch.int),
         shape=[parallel_size, 8, width // patch_size, height // patch_size]
     )
 
@@ -136,7 +170,7 @@ def generate_image(prompt, seed, guidance):
     width = 384
     height = 384
     parallel_size = 5
-    
+
     with torch.no_grad():
         messages = [{'role': 'User', 'content': prompt}, {'role': 'Assistant', 'content': ''}]
         text = vl_chat_processor.apply_sft_template_for_multi_turn_prompts(
